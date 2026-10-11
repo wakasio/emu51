@@ -13,6 +13,12 @@ What it models
 What it does not model
   - interrupts, timers, serial, real ports (P1 bank switching only if you map it yourself)
   - timing
+Notes
+  - SP starts at 0x07 (8051 reset value); real firmware moves it (EH33 0x9D, VAD6038 0x9B),
+    so pass sp= to CPU() when running firmware code.
+  - IRAM and SFRs start at 0, ports included (a real 8051 resets P0-P3 to 0xFF). MOVX @Ri uses
+    P2 as the high address byte.
+  - cpu.steps counts instructions since the CPU was created; call() returns the count of one call.
 
 Example
     img = open('fw.bin', 'rb').read()
@@ -43,15 +49,25 @@ class CPU:
         self.iram = bytearray(256)          # 00-7F direct/indirect, 80-FF indirect only
         self.sfr = bytearray(256)           # 80-FF direct
         self.x = {}                         # XDATA
-        self.xr_hook = None                 # f(cpu, addr) -> value or None
+        self.xr_hook = None                 # f(cpu, addr) -> value or None (single hook)
         self.xw_hook = None                 # f(cpu, addr, value) -> True to swallow the write
+        self.xr_hooks = []                  # chained hooks, see add_xr_hook / add_xw_hook
+        self.xw_hooks = []
         self.pc = 0
         self.sfr[0x81] = sp
         self.steps = 0
 
     # ---- memory
     def code(self, a):
-        return self.img[self.code_map(a & 0xFFFF)]
+        f = self.code_map(a & 0xFFFF)
+        if not 0 <= f < len(self.img):
+            raise RuntimeError('code address %04X maps to file offset %X, outside the %d-byte image'
+                               % (a & 0xFFFF, f, len(self.img)))
+        return self.img[f]
+
+    def _operand(self, a):                  # operand byte; 0 past the image end
+        f = self.code_map(a & 0xFFFF)
+        return self.img[f] if 0 <= f < len(self.img) else 0
 
     def rd(self, d):                        # direct address
         return self.iram[d] if d < 0x80 else self.sfr[d]
@@ -62,17 +78,32 @@ class CPU:
         else:
             self.sfr[d] = v & 0xFF
 
+    def add_xr_hook(self, f):
+        """Add a read hook f(cpu, addr) -> value or None. Hooks are asked in the order added
+        (then xr_hook); the first value that is not None is the result."""
+        self.xr_hooks.append(f)
+        return f
+
+    def add_xw_hook(self, f):
+        """Add a write hook f(cpu, addr, value) -> True to swallow the write. Every hook (and
+        xw_hook) sees every write; the write reaches cpu.x unless one of them returns True."""
+        self.xw_hooks.append(f)
+        return f
+
     def xread(self, a):
-        if self.xr_hook:
-            r = self.xr_hook(self, a)
+        for f in self.xr_hooks + ([self.xr_hook] if self.xr_hook else []):
+            r = f(self, a)
             if r is not None:
                 return r & 0xFF
         return self.x.get(a, 0)
 
     def xwrite(self, a, v):
-        if self.xw_hook and self.xw_hook(self, a, v & 0xFF):
-            return
-        self.x[a] = v & 0xFF
+        v &= 0xFF
+        swallow = False
+        for f in self.xw_hooks + ([self.xw_hook] if self.xw_hook else []):
+            swallow = bool(f(self, a, v)) or swallow
+        if not swallow:
+            self.x[a] = v
 
     def bitaddr(self, b):
         return (0x20 + (b >> 3)) if b < 0x80 else (b & 0xF8), b & 7
@@ -103,6 +134,7 @@ class CPU:
     @A.setter
     def A(self, v):
         self.sfr[0xE0] = v & 0xFF
+        self.sfr[0xD0] = (self.sfr[0xD0] & ~1) | (bin(v & 0xFF).count('1') & 1)
 
     @property
     def B(self):
@@ -163,7 +195,7 @@ class CPU:
     # ---- execution
     def step(self):
         pc = self.pc
-        op, b1, b2 = self.code(pc), self.code(pc + 1), self.code(pc + 2)
+        op, b1, b2 = self.code(pc), self._operand(pc + 1), self._operand(pc + 2)
         hi, lo = op >> 4, op & 15
         rel = lambda r, n: (pc + n + ((r ^ 0x80) - 0x80)) & 0xFFFF
         n, npc = 1, None
@@ -368,29 +400,31 @@ class CPU:
                 npc = rel(b1, 2)
         elif op == 0xE0:
             self.A = self.xread(self.DPTR)
-        elif op in (0xE2, 0xE3):
-            self.A = self.xread(self.R(op - 0xE2))
+        elif op in (0xE2, 0xE3):                                # MOVX A,@Ri: P2 is the high byte
+            self.A = self.xread((self.sfr[0xA0] << 8) | self.R(op - 0xE2))
         elif op == 0xE4:
             self.A = 0
         elif hi == 0xE and lo >= 5:
             self.A = src()
         elif op == 0xF0:
             self.xwrite(self.DPTR, self.A)
-        elif op in (0xF2, 0xF3):
-            self.xwrite(self.R(op - 0xF2), self.A)
+        elif op in (0xF2, 0xF3):                                # MOVX @Ri,A: P2 is the high byte
+            self.xwrite((self.sfr[0xA0] << 8) | self.R(op - 0xF2), self.A)
         elif op == 0xF4:
             self.A = ~self.A
         elif hi == 0xF and lo >= 5:
             dst(self.A)
         else:
-            raise RuntimeError('unhandled opcode %02X at %04X' % (op, pc))
+            raise RuntimeError('internal error: opcode %02X at %04X not dispatched' % (op, pc))
         self.sfr[0xD0] = (self.sfr[0xD0] & ~1) | (bin(self.A).count('1') & 1)
         self.pc = npc if npc is not None else (pc + n) & 0xFFFF
         self.steps += 1
 
-    def call(self, addr, maxn=200000):
-        """Push a sentinel return address, run from addr until that RET; returns step count."""
-        ra = 0xFFF0
+    def call(self, addr, maxn=200000, ret=0xFFF0):
+        """Push the sentinel return address ret, run from addr until pc == ret (the routine's
+        final RET) and return the number of instructions executed. Pick another ret if the
+        image has code at 0xFFF0 that the routine may reach."""
+        ra = ret
         self.push(ra & 0xFF); self.push(ra >> 8)
         self.pc, k = addr, 0
         while self.pc != ra:
@@ -400,7 +434,9 @@ class CPU:
         return k
 
     def run_until(self, addr, stops, maxn=200000):
-        """Run from addr until pc is in stops; returns the stop address."""
+        """Run from addr until pc is in stops and return that address. The check comes before
+        each instruction: the stop instruction is not executed, and if addr itself is in
+        stops nothing runs."""
         self.pc, k = addr, 0
         while self.pc not in stops:
             self.step(); k += 1
@@ -417,17 +453,15 @@ class Divider:
     also uses commands 0x01-0x07, 0x13, 0x21; those raise an error here."""
 
     def attach(self, cpu):
-        prev = cpu.xw_hook
-
         def hook(c, a, v):
-            if a == 0x403B and v:
-                d = {0x62: 60, 0x72: 75}.get(v)
-                if d is None:
-                    raise RuntimeError('divider command %02X not modelled' % v)
-                x = (c.x.get(0x403D, 0) << 16) | (c.x.get(0x403E, 0) << 8) | c.x.get(0x403F, 0)
-                q, r = divmod(x, d)
-                c.x.update({0x403D: q >> 16 & 255, 0x403E: q >> 8 & 255, 0x403F: q & 255, 0x4043: r, 0x403B: 0})
-                return True
-            return prev(c, a, v) if prev else False
-        cpu.xw_hook = hook
+            if a != 0x403B or not v:
+                return False
+            d = {0x62: 60, 0x72: 75}.get(v)
+            if d is None:
+                raise RuntimeError('divider command %02X not modelled' % v)
+            x = (c.x.get(0x403D, 0) << 16) | (c.x.get(0x403E, 0) << 8) | c.x.get(0x403F, 0)
+            q, r = divmod(x, d)
+            c.x.update({0x403D: q >> 16 & 255, 0x403E: q >> 8 & 255, 0x403F: q & 255, 0x4043: r, 0x403B: 0})
+            return True
+        cpu.add_xw_hook(hook)
         return cpu

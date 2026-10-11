@@ -20,16 +20,17 @@ def bitname(b):
     base = dname(byte) if b>=0x80 else "0x%02X"%byte
     return "%s.%d"%(base,bit)
 
-def decode(d, off):
-    """Return (length, text, (flowtype,target))."""
+def decode(d, off, addr=None):
+    """Return (length, text, (flowtype,target)) for the instruction at file offset off.
+    addr is its code address (for jump targets); if omitted, off + off_base is used,
+    where off_base is set by disasm()."""
+    ob = off_base if addr is None else addr - off
     op = d[off]
     hi, lo = op>>4, op&0xF
     b1 = d[off+1] if off+1<len(d) else 0
     b2 = d[off+2] if off+2<len(d) else 0
     def rel(r, l):
-        return (off_base + off + l + ((r^0x80)-0x80)) & 0xFFFF
-    # off_base maps file offset -> code addr; set by disasm(); default 0
-    global off_base
+        return (ob + off + l + ((r^0x80)-0x80)) & 0xFFFF
     # --- regular Rn / @Ri groups by low nibble 6..F ---
     if lo>=0x8:
         rn = lo-0x8
@@ -65,7 +66,7 @@ def decode(d, off):
         if hi==0xF: return 1,("MOV @R%d,A"%ri),(None,None)
     # --- low nibble 1: AJMP/ACALL (addr11) ---
     if lo==0x1:
-        t = ((off_base+off+2)&0xF800) | ((op&0xE0)<<3) | b1
+        t = ((ob+off+2)&0xF800) | ((op&0xE0)<<3) | b1
         if hi%2==0: return 2,("AJMP 0x%04X"%t),('jmp',t)
         else:       return 2,("ACALL 0x%04X"%t),('call',t)
     # --- column 0 ---
@@ -175,6 +176,8 @@ def disasm(d, start, length, base=0):
     return '\n'.join(out)
 
 if __name__=='__main__':
+    if len(sys.argv) < 4:
+        sys.exit(__doc__.strip().splitlines()[1])
     f=sys.argv[1]; start=int(sys.argv[2],16); length=int(sys.argv[3],16)
     base=int(sys.argv[4],16) if len(sys.argv)>4 else start
     d=open(f,'rb').read()
